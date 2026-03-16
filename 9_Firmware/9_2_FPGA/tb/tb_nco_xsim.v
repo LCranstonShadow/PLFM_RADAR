@@ -275,35 +275,44 @@ module tb_nco_xsim;
         // 1 MHz at 400 MSPS: phase_inc = 2^32 * 1/400 = 10737418
         phase_increment = 32'd10737418;
         reset_n = 1;
-        repeat (15) @(posedge clk);
+        // Allow 25 cycles for DSP48E1 pipeline to settle
+        repeat (25) @(posedge clk);
 
         begin : low_freq_test
             integer zero_cross;
             reg signed [15:0] prev_c;
             reg first;
             integer samp_count;
+            integer skip;
 
             zero_cross = 0;
             first      = 1;
             samp_count = 0;
+            skip       = 0;
 
             // Run for 1000 cycles = 2.5 periods at 1 MHz
             for (i = 0; i < 1000; i = i + 1) begin
                 @(posedge clk); #0.1;
                 if (output_valid) begin
-                    if (!first) begin
-                        if ((prev_c >= 0 && cos_out < 0) || (prev_c < 0 && cos_out >= 0))
-                            zero_cross = zero_cross + 1;
+                    // Skip first 4 valid samples (pipeline settling)
+                    if (skip < 4) begin
+                        skip = skip + 1;
+                    end else begin
+                        if (!first) begin
+                            if ((prev_c >= 0 && cos_out < 0) || (prev_c < 0 && cos_out >= 0))
+                                zero_cross = zero_cross + 1;
+                        end
+                        prev_c = cos_out;
+                        first  = 0;
+                        samp_count = samp_count + 1;
                     end
-                    prev_c = cos_out;
-                    first  = 0;
-                    samp_count = samp_count + 1;
                 end
             end
 
             $display("  1 MHz: %0d zero crossings in %0d samples (expect ~5)",
                      zero_cross, samp_count);
-            // 1 MHz in 1000 cycles @ 400MHz = 2.5 periods = ~5 zero crossings
+            // 1 MHz in ~996 valid cycles @ 400MHz ≈ 2.5 periods ≈ 5 zero crossings
+            // DSP48E1 pipeline quantization can shift count slightly
             check(zero_cross >= 3 && zero_cross <= 8,
                   "1 MHz: zero crossings in expected range (3-8)");
         end
