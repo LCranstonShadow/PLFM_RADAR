@@ -715,7 +715,12 @@ usb_data_interface usb_inst (
     .status_short_chirp(host_short_chirp_cycles),
     .status_short_listen(host_short_listen_cycles),
     .status_chirps_per_elev(host_chirps_per_elev),
-    .status_range_mode(host_range_mode)
+    .status_range_mode(host_range_mode),
+
+    // Self-test status readback
+    .status_self_test_flags(self_test_flags_latched),
+    .status_self_test_detail(self_test_detail_latched),
+    .status_self_test_busy(self_test_busy)
 );
 
 // ============================================================================
@@ -836,6 +841,7 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
                 8'h27: host_dc_notch_width     <= usb_cmd_value[2:0];
                 // Board bring-up self-test opcodes
                 8'h30: host_self_test_trigger  <= 1'b1;  // Trigger self-test
+                8'h31: host_status_request     <= 1'b1;  // Self-test readback (status alias)
                 // 0x31: readback handled via status mechanism (latched results)
                 8'hFF: host_status_request     <= 1'b1;  // Gap 2: status readback
                 default: ;

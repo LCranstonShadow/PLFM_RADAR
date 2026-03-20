@@ -75,6 +75,7 @@ PROD_RTL=(
     rx_gain_control.v
     cfar_ca.v
     mti_canceller.v
+    fpga_self_test.v
 )
 
 # Source-only RTL (not instantiated at top level, but should still be lint-clean)
@@ -386,6 +387,10 @@ run_test "CFAR CA Detector" \
     tb/tb_cfar_ca.vvp \
     tb/tb_cfar_ca.v cfar_ca.v
 
+run_test "FPGA Self-Test" \
+    tb/tb_fpga_self_test.vvp \
+    tb/tb_fpga_self_test.v fpga_self_test.v
+
 echo ""
 
 # ===========================================================================
@@ -436,7 +441,7 @@ if [[ "$QUICK" -eq 0 ]]; then
         matched_filter_multi_segment.v matched_filter_processing_chain.v \
         range_bin_decimator.v doppler_processor.v xfft_32.v fft_engine.v \
         usb_data_interface.v edge_detector.v radar_mode_controller.v \
-        rx_gain_control.v cfar_ca.v mti_canceller.v
+        rx_gain_control.v cfar_ca.v mti_canceller.v fpga_self_test.v
 
     # E2E integration (46 strict checks: TX, RX, USB R/W, CDC, safety, reset)
     run_test "System E2E (tb_system_e2e)" \
@@ -450,7 +455,7 @@ if [[ "$QUICK" -eq 0 ]]; then
         matched_filter_multi_segment.v matched_filter_processing_chain.v \
         range_bin_decimator.v doppler_processor.v xfft_32.v fft_engine.v \
         usb_data_interface.v edge_detector.v radar_mode_controller.v \
-        rx_gain_control.v cfar_ca.v mti_canceller.v
+        rx_gain_control.v cfar_ca.v mti_canceller.v fpga_self_test.v
 else
     echo "  (skipped receiver golden + system top + E2E — use without --quick)"
     SKIP=$((SKIP + 4))

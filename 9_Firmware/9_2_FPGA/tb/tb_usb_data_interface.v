@@ -74,6 +74,11 @@ module tb_usb_data_interface;
     reg  [5:0]  status_chirps_per_elev;
     reg  [1:0]  status_range_mode;
 
+    // Self-test status readback inputs
+    reg  [4:0]  status_self_test_flags;
+    reg  [7:0]  status_self_test_detail;
+    reg         status_self_test_busy;
+
     // ── Clock generators (asynchronous) ────────────────────────
     always #(CLK_PERIOD / 2) clk = ~clk;
     always #(FT_CLK_PERIOD / 2) ft601_clk_in = ~ft601_clk_in;
@@ -124,7 +129,12 @@ module tb_usb_data_interface;
         .status_short_chirp    (status_short_chirp),
         .status_short_listen   (status_short_listen),
         .status_chirps_per_elev(status_chirps_per_elev),
-        .status_range_mode     (status_range_mode)
+        .status_range_mode     (status_range_mode),
+
+        // Self-test status readback
+        .status_self_test_flags (status_self_test_flags),
+        .status_self_test_detail(status_self_test_detail),
+        .status_self_test_busy  (status_self_test_busy)
     );
 
     // ── Test bookkeeping ───────────────────────────────────────
@@ -181,6 +191,9 @@ module tb_usb_data_interface;
             status_short_listen   = 16'd17450;
             status_chirps_per_elev = 6'd32;
             status_range_mode     = 2'b00;
+            status_self_test_flags  = 5'b00000;
+            status_self_test_detail = 8'd0;
+            status_self_test_busy   = 1'b0;
             repeat (6) @(posedge ft601_clk_in);
             reset_n = 1;
             // Wait enough cycles for stream_control CDC to propagate
@@ -867,7 +880,7 @@ module tb_usb_data_interface;
 
         // ════════════════════════════════════════════════════════
         // TEST GROUP 16: Status Readback (Gap 2)
-        // Verify that pulsing status_request triggers a 7-word
+        // Verify that pulsing status_request triggers an 8-word
         // status response via the SEND_STATUS state.
         // ════════════════════════════════════════════════════════
         $display("\n--- Test Group 16: Status Readback (Gap 2) ---");
@@ -885,6 +898,10 @@ module tb_usb_data_interface;
         status_short_listen    = 16'd17450;
         status_chirps_per_elev = 6'd32;
         status_range_mode      = 2'b10;  // Long-range for status test
+        // Self-test status: all 5 tests passed, detail=0xA5, not busy
+        status_self_test_flags  = 5'b11111;
+        status_self_test_detail = 8'hA5;
+        status_self_test_busy   = 1'b0;
 
         // Pulse status_request (1 cycle in clk domain — toggles status_req_toggle_100m)
         @(posedge clk);
@@ -903,14 +920,14 @@ module tb_usb_data_interface;
         check(uut.current_state === S_SEND_STATUS,
               "Status readback: FSM entered SEND_STATUS");
 
-        // The SEND_STATUS state sends 7 words (idx 0-6):
-        // idx 0: 0xBB header, idx 1-5: status_words[0-4], idx 6: 0x55 footer
-        // After idx 6 it transitions to WAIT_ACK -> IDLE.
-        // Since ft601_txe=0, all 7 words should stream without stall.
+        // The SEND_STATUS state sends 8 words (idx 0-7):
+        // idx 0: 0xBB header, idx 1-6: status_words[0-5], idx 7: 0x55 footer
+        // After idx 7 it transitions to WAIT_ACK -> IDLE.
+        // Since ft601_txe=0, all 8 words should stream without stall.
         wait_for_state(S_IDLE, 100);
         #1;
         check(uut.current_state === S_IDLE,
-              "Status readback: returned to IDLE after 7-word response");
+              "Status readback: returned to IDLE after 8-word response");
 
         // Verify the status snapshot was captured correctly.
         // status_words[0] = {0xFF, 3'b000, mode[1:0], 5'b0, stream_ctrl[2:0], cfar_threshold[15:0]}
@@ -943,6 +960,10 @@ module tb_usb_data_interface;
               "Status readback: word 3 = {short_listen, 0, chirps_per_elev}");
         check(uut.status_words[4] === {30'd0, 2'b10},
               "Status readback: word 4 = range_mode=2'b10");
+        // status_words[5] = {7'd0, busy, 8'd0, detail[7:0], 3'd0, flags[4:0]}
+        // = {7'd0, 1'b0, 8'd0, 8'hA5, 3'd0, 5'b11111}
+        check(uut.status_words[5] === {7'd0, 1'b0, 8'd0, 8'hA5, 3'd0, 5'b11111},
+              "Status readback: word 5 = self-test {busy=0, detail=A5, flags=1F}");
 
         // ════════════════════════════════════════════════════════
         // TEST GROUP 17: New Chirp Timing Opcodes (Gap 2)
@@ -998,6 +1019,41 @@ module tb_usb_data_interface;
         send_host_command({8'hFF, 8'h00, 16'h0000});
         check(cmd_opcode === 8'hFF,
               "Chirp opcode: 0xFF (status request)");
+
+        // ════════════════════════════════════════════════════════
+        // TEST GROUP 18: Self-Test Readback Variants
+        // Verify self-test busy flag, partial failures, and
+        // alternate status word 5 values.
+        // ════════════════════════════════════════════════════════
+        $display("\n--- Test Group 18: Self-Test Readback Variants ---");
+        apply_reset;
+        ft601_txe = 0;
+
+        // Scenario A: Self-test busy, partial failure, different detail
+        status_self_test_flags  = 5'b10110;  // T0 fail, T3 fail
+        status_self_test_detail = 8'h42;
+        status_self_test_busy   = 1'b1;
+
+        // Trigger status readback
+        @(posedge clk);
+        status_request = 1;
+        @(posedge clk);
+        status_request = 0;
+
+        repeat (8) @(posedge ft601_clk_in); #1;
+        wait_for_state(S_SEND_STATUS, 20);
+        #1;
+        check(uut.current_state === S_SEND_STATUS,
+              "Self-test readback A: FSM entered SEND_STATUS");
+
+        wait_for_state(S_IDLE, 100);
+        #1;
+        check(uut.current_state === S_IDLE,
+              "Self-test readback A: returned to IDLE");
+
+        // Verify word 5: {7'd0, busy=1, 8'd0, detail=0x42, 3'd0, flags=5'b10110}
+        check(uut.status_words[5] === {7'd0, 1'b1, 8'd0, 8'h42, 3'd0, 5'b10110},
+              "Self-test readback A: word 5 = {busy=1, detail=42, flags=16}");
 
         // ════════════════════════════════════════════════════════
         // Summary

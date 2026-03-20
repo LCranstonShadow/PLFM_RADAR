@@ -72,7 +72,12 @@ module usb_data_interface (
     input wire [15:0] status_short_chirp,      // Current short chirp cycles
     input wire [15:0] status_short_listen,     // Current short listen cycles
     input wire [5:0]  status_chirps_per_elev,  // Current chirps per elevation
-    input wire [1:0]  status_range_mode        // Fix 7: Current range mode (0x20)
+    input wire [1:0]  status_range_mode,       // Fix 7: Current range mode (0x20)
+
+    // Self-test status readback (opcode 0x31 / included in 0xFF status packet)
+    input wire [4:0]  status_self_test_flags,  // Per-test PASS(1)/FAIL(0) latched
+    input wire [7:0]  status_self_test_detail, // Diagnostic detail byte latched
+    input wire        status_self_test_busy    // Self-test FSM still running
 );
 
 // USB packet structure (same as before)
@@ -210,7 +215,7 @@ wire status_req_ft601 = status_req_sync[1] ^ status_req_sync_prev;
 // Status snapshot: captured in ft601_clk domain when status request arrives.
 // The clk_100m-domain status inputs are stable for many cycles after the
 // command decode, so sampling them a few ft601_clk cycles later is safe.
-reg [31:0] status_words [0:4];  // 5 status words
+reg [31:0] status_words [0:5];  // 6 status words (word 5 = self-test)
 reg [2:0] status_word_idx;
 
 wire range_valid_ft;
@@ -265,6 +270,10 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
             status_words[3] <= {status_short_listen, 10'd0, status_chirps_per_elev};
             // Word 4: Fix 7 — range_mode in bits [1:0], rest reserved
             status_words[4] <= {30'd0, status_range_mode};
+            // Word 5: Self-test results {reserved[6:0], busy, reserved[7:0], detail[7:0], reserved[2:0], flags[4:0]}
+            status_words[5] <= {7'd0, status_self_test_busy,
+                                8'd0, status_self_test_detail,
+                                3'd0, status_self_test_flags};
         end
 
         // Delayed version of sync[1] for edge detection
@@ -524,8 +533,8 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
                     end
                 end
 
-                // Gap 2: Status readback — send 5 x 32-bit status words
-                // Format: HEADER, status_words[0..4], FOOTER
+                // Gap 2: Status readback — send 6 x 32-bit status words
+                // Format: HEADER, status_words[0..5], FOOTER
                 SEND_STATUS: begin
                     if (!ft601_txe) begin
                         ft601_data_oe <= 1;
@@ -541,7 +550,8 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
                             3'd3: ft601_data_out <= status_words[2];
                             3'd4: ft601_data_out <= status_words[3];
                             3'd5: ft601_data_out <= status_words[4];
-                            3'd6: begin
+                            3'd6: ft601_data_out <= status_words[5];
+                            3'd7: begin
                                 // Send status footer
                                 ft601_data_out <= {24'b0, FOOTER};
                                 ft601_be <= 4'b0001;
@@ -549,7 +559,7 @@ always @(posedge ft601_clk_in or negedge ft601_reset_n) begin
                             default: ;
                         endcase
                         ft601_wr_n <= 0;
-                        if (status_word_idx == 3'd6) begin
+                        if (status_word_idx == 3'd7) begin
                             status_word_idx <= 3'd0;
                             current_state <= WAIT_ACK;
                         end else begin
