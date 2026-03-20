@@ -167,6 +167,11 @@ reg rx_detect_valid;      // Detection valid pulse (was rx_cfar_valid)
 // Frame-complete signal from Doppler processor (for CFAR)
 wire rx_frame_complete;
 
+// ADC debug tap from receiver (clk_100m domain, post-DDC)
+wire [15:0] rx_dbg_adc_i;
+wire [15:0] rx_dbg_adc_q;
+wire        rx_dbg_adc_valid;
+
 // Data packing for USB
 wire [31:0] usb_range_profile;
 wire usb_range_valid;
@@ -237,6 +242,20 @@ reg        host_cfar_enable;      // Opcode 0x25: 1=CFAR, 0=simple threshold
 // Ground clutter removal registers (host-configurable via USB)
 reg        host_mti_enable;       // Opcode 0x26: 1=MTI active, 0=pass-through
 reg [2:0]  host_dc_notch_width;   // Opcode 0x27: DC notch ±width bins (0=off, 1..7)
+
+// Board bring-up self-test registers (opcode 0x30 trigger, 0x31 readback)
+reg        host_self_test_trigger;  // Opcode 0x30: self-clearing pulse
+wire       self_test_busy;
+wire       self_test_result_valid;
+wire [4:0] self_test_result_flags;  // Per-test PASS(1)/FAIL(0)
+wire [7:0] self_test_result_detail; // Diagnostic detail byte
+// Self-test latched results (hold until next trigger)
+reg  [4:0] self_test_flags_latched;
+reg  [7:0] self_test_detail_latched;
+// Self-test ADC capture wires
+wire       self_test_capture_active;
+wire [15:0] self_test_capture_data;
+wire       self_test_capture_valid;
 
 // ============================================================================
 // CLOCK BUFFERING
@@ -471,7 +490,7 @@ radar_receiver_final rx_inst (
     .range_profile_q_out(rx_range_profile[31:16]),
     .range_profile_valid_out(rx_range_valid),
     
-    // Host command inputs (Gap 4: USB Read Path, CDC-synchronized)
+    // Host command inputs (Gap 4: USB Read Path)
     .host_mode(host_radar_mode),
     .host_trigger(host_trigger_pulse),
     // Gap 2: Host-configurable chirp timing
@@ -493,7 +512,11 @@ radar_receiver_final rx_inst (
     .doppler_frame_done_out(rx_frame_complete),
     // Ground clutter removal
     .host_mti_enable(host_mti_enable),
-    .host_dc_notch_width(host_dc_notch_width)
+    .host_dc_notch_width(host_dc_notch_width),
+    // ADC debug tap (for self-test / bring-up)
+    .dbg_adc_i(rx_dbg_adc_i),
+    .dbg_adc_q(rx_dbg_adc_q),
+    .dbg_adc_valid(rx_dbg_adc_valid)
 );
 
 // ============================================================================
@@ -585,6 +608,40 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
     end else begin
         rx_detect_flag  <= cfar_detect_flag;
         rx_detect_valid <= cfar_detect_valid;
+    end
+end
+
+// ============================================================================
+// BOARD BRING-UP SELF-TEST (opcode 0x30 trigger, 0x31 readback)
+// ============================================================================
+// Exercises key subsystems independently on first power-on.
+// ADC data input is tied to real ADC data.
+
+fpga_self_test self_test_inst (
+    .clk(clk_100m_buf),
+    .reset_n(sys_reset_n),
+    .trigger(host_self_test_trigger),
+    .busy(self_test_busy),
+    .result_valid(self_test_result_valid),
+    .result_flags(self_test_result_flags),
+    .result_detail(self_test_result_detail),
+    .adc_data_in(rx_dbg_adc_i),   // Post-DDC I channel (clk_100m, 16-bit signed)
+    .adc_valid_in(rx_dbg_adc_valid), // DDC output valid (clk_100m)
+    .capture_active(self_test_capture_active),
+    .capture_data(self_test_capture_data),
+    .capture_valid(self_test_capture_valid)
+);
+
+// Latch self-test results when valid (hold until next trigger)
+always @(posedge clk_100m_buf or negedge sys_reset_n) begin
+    if (!sys_reset_n) begin
+        self_test_flags_latched  <= 5'b00000;
+        self_test_detail_latched <= 8'd0;
+    end else begin
+        if (self_test_result_valid) begin
+            self_test_flags_latched  <= self_test_result_flags;
+            self_test_detail_latched <= self_test_result_detail;
+        end
     end
 end
 
@@ -733,9 +790,12 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
         // Ground clutter removal defaults (disabled — backward-compatible)
         host_mti_enable         <= 1'b0;      // MTI off
         host_dc_notch_width     <= 3'd0;      // DC notch off
+        // Self-test defaults
+        host_self_test_trigger  <= 1'b0;      // Self-test idle
     end else begin
         host_trigger_pulse <= 1'b0;    // Self-clearing pulse
         host_status_request <= 1'b0;   // Self-clearing pulse
+        host_self_test_trigger <= 1'b0;  // Self-clearing pulse
         if (cmd_valid_100m) begin
             case (usb_cmd_opcode)
                 8'h01: host_radar_mode     <= usb_cmd_value[1:0];
@@ -774,6 +834,9 @@ always @(posedge clk_100m_buf or negedge sys_reset_n) begin
                 // Ground clutter removal opcodes
                 8'h26: host_mti_enable         <= usb_cmd_value[0];
                 8'h27: host_dc_notch_width     <= usb_cmd_value[2:0];
+                // Board bring-up self-test opcodes
+                8'h30: host_self_test_trigger  <= 1'b1;  // Trigger self-test
+                // 0x31: readback handled via status mechanism (latched results)
                 8'hFF: host_status_request     <= 1'b1;  // Gap 2: status readback
                 default: ;
             endcase

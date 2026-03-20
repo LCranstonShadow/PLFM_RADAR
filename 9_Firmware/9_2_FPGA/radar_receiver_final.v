@@ -55,7 +55,12 @@ module radar_receiver_final (
 
     // Ground clutter removal controls
     input wire        host_mti_enable,       // 1=MTI active, 0=pass-through
-    input wire [2:0]  host_dc_notch_width    // DC notch: zero Doppler bins within ±width of DC
+    input wire [2:0]  host_dc_notch_width,   // DC notch: zero Doppler bins within ±width of DC
+
+    // ADC raw data tap (clk_100m domain, post-DDC, for self-test / debug)
+    output wire [15:0] dbg_adc_i,            // DDC output I (16-bit signed, 100 MHz)
+    output wire [15:0] dbg_adc_q,            // DDC output Q (16-bit signed, 100 MHz)
+    output wire        dbg_adc_valid         // DDC output valid (100 MHz)
 );
 
 // ========== INTERNAL SIGNALS ==========
@@ -463,5 +468,9 @@ always @(posedge clk or negedge reset_n) begin
 end
 
 
+// ========== ADC DEBUG TAP (for self-test / bring-up) ==========
+assign dbg_adc_i     = adc_i_scaled;
+assign dbg_adc_q     = adc_q_scaled;
+assign dbg_adc_valid = adc_valid_sync;
 
 endmodule
