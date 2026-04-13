@@ -97,6 +97,11 @@ class RadarDashboard:
         self.frame_queue: queue.Queue[RadarFrame] = queue.Queue(maxsize=8)
         self._acq_thread: RadarAcquisition | None = None
 
+        # Thread-safe UI message queue — avoids calling root.after() from
+        # background threads which crashes Python 3.12 (GIL state corruption).
+        # Entries are (tag, payload) tuples drained by _schedule_update().
+        self._ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
         # Display state
         self._current_frame = RadarFrame()
         self._waterfall = deque(maxlen=WATERFALL_DEPTH)
@@ -577,8 +582,8 @@ class RadarDashboard:
                                  insertbackground=FG, wrap="word")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # Redirect log handler to text widget
-        handler = _TextHandler(self.log_text)
+        # Redirect log handler to text widget (via UI queue for thread safety)
+        handler = _TextHandler(self._ui_queue)
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                                 datefmt="%H:%M:%S"))
         logging.getLogger().addHandler(handler)
@@ -604,8 +609,8 @@ class RadarDashboard:
 
         def _do_connect():
             ok = self.conn.open(self.device_index)
-            # Schedule UI update back on the main thread
-            self.root.after(0, lambda: self._on_connect_done(ok))
+            # Post result to UI queue (drained by _schedule_update)
+            self._ui_queue.put(("connect", ok))
 
         threading.Thread(target=_do_connect, daemon=True).start()
 
@@ -653,8 +658,8 @@ class RadarDashboard:
             log.error("Invalid custom command values")
 
     def _on_status_received(self, status: StatusResponse):
-        """Called from acquisition thread — schedule UI update on main thread."""
-        self.root.after(0, self._update_self_test_labels, status)
+        """Called from acquisition thread — post to UI queue for main thread."""
+        self._ui_queue.put(("status", status))
 
     def _update_self_test_labels(self, status: StatusResponse):
         """Update the self-test result labels and AGC status from a StatusResponse."""
@@ -782,8 +787,33 @@ class RadarDashboard:
 
     # --------------------------------------------------------- Display loop
     def _schedule_update(self):
+        self._drain_ui_queue()
         self._update_display()
         self.root.after(self.UPDATE_INTERVAL_MS, self._schedule_update)
+
+    def _drain_ui_queue(self):
+        """Process all pending cross-thread messages on the main thread."""
+        while True:
+            try:
+                tag, payload = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if tag == "connect":
+                self._on_connect_done(payload)
+            elif tag == "status":
+                self._update_self_test_labels(payload)
+            elif tag == "log":
+                self._log_handler_append(payload)
+
+    def _log_handler_append(self, msg: str):
+        """Append a log message to the log Text widget (main thread only)."""
+        with contextlib.suppress(Exception):
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+            # Keep last 500 lines
+            lines = int(self.log_text.index("end-1c").split(".")[0])
+            if lines > 500:
+                self.log_text.delete("1.0", f"{lines - 500}.0")
 
     def _update_display(self):
         """Pull latest frame from queue and update plots."""
@@ -849,24 +879,21 @@ class RadarDashboard:
 
 
 class _TextHandler(logging.Handler):
-    """Logging handler that writes to a tkinter Text widget."""
+    """Logging handler that posts messages to a queue for main-thread append.
 
-    def __init__(self, text_widget: tk.Text):
+    Using widget.after() from background threads crashes Python 3.12 due to
+    GIL state corruption.  Instead we post to the dashboard's _ui_queue and
+    let _drain_ui_queue() append on the main thread.
+    """
+
+    def __init__(self, ui_queue: queue.Queue[tuple[str, object]]):
         super().__init__()
-        self._text = text_widget
+        self._ui_queue = ui_queue
 
     def emit(self, record):
         msg = self.format(record)
         with contextlib.suppress(Exception):
-            self._text.after(0, self._append, msg)
-
-    def _append(self, msg: str):
-        self._text.insert("end", msg + "\n")
-        self._text.see("end")
-        # Keep last 500 lines
-        lines = int(self._text.index("end-1c").split(".")[0])
-        if lines > 500:
-            self._text.delete("1.0", f"{lines - 500}.0")
+            self._ui_queue.put(("log", msg))
 
 
 # ============================================================================
