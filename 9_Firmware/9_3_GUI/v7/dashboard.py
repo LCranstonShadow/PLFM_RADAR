@@ -23,10 +23,8 @@ commands sent over FT2232H.
 """
 
 import time
-import re
 import logging
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 
@@ -44,7 +42,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from .models import (
-    RadarTarget, RadarSettings, WaveformConfig, GPSData, ProcessingConfig,
+    RadarTarget, RadarSettings, GPSData, ProcessingConfig,
     DARK_BG, DARK_FG, DARK_ACCENT, DARK_HIGHLIGHT, DARK_BORDER,
     DARK_TEXT, DARK_BUTTON, DARK_BUTTON_HOVER,
     DARK_TREEVIEW, DARK_TREEVIEW_ALT,
@@ -61,10 +59,8 @@ from .hardware import (
     DataRecorder,
     STM32USBInterface,
 )
-from .processing import RadarProcessor, USBPacketParser, RawIQFrameProcessor
-from .workers import RadarDataWorker, RawIQReplayWorker, GPSDataWorker, TargetSimulator
-from .raw_iq_replay import RawIQReplayController, PlaybackState
-from .agc_sim import AGCConfig
+from .processing import RadarProcessor, USBPacketParser
+from .workers import RadarDataWorker, GPSDataWorker, TargetSimulator
 from .map_widget import RadarMapWidget
 
 logger = logging.getLogger(__name__)
@@ -85,69 +81,24 @@ def _make_dspin() -> QDoubleSpinBox:
     return sb
 
 
-def _parse_waveform_from_filename(name: str) -> WaveformConfig | None:
-    """Try to extract waveform params from ADI phaser filename convention.
-
-    Expected pattern fragments (order-independent):
-      ``<N>MSPS`` or ``<N>MSps`` → sample rate in MHz
-      ``<N>M``  (followed by _ or end) → bandwidth in MHz
-      ``<N>u``  (followed by _ or end) → chirp duration in µs
-
-    Returns a WaveformConfig with parsed values (defaults for un-parsed),
-    or None if nothing recognisable was found.
-    """
-    cfg = WaveformConfig()  # ADI phaser defaults
-    found = False
-
-    # Sample rate: "4MSPS" or "4MSps"
-    m = re.search(r"(\d+)M[Ss][Pp][Ss]", name)
-    if m:
-        cfg.sample_rate_hz = float(m.group(1)) * 1e6
-        found = True
-
-    # Bandwidth: "500M" (must NOT be followed by S for MSPS)
-    m = re.search(r"(\d+)M(?![Ss])", name)
-    if m:
-        cfg.bandwidth_hz = float(m.group(1)) * 1e6
-        found = True
-
-    # Chirp duration: "300u"
-    m = re.search(r"(\d+)u", name)
-    if m:
-        cfg.chirp_duration_s = float(m.group(1)) * 1e-6
-        found = True
-
-    return cfg if found else None
-
-
 # =============================================================================
 # Range-Doppler Canvas (matplotlib)
 # =============================================================================
 
 class RangeDopplerCanvas(FigureCanvasQTAgg):
-    """Matplotlib canvas showing a Range-Doppler map with dark theme.
-
-    Adapts dynamically to incoming frame dimensions (e.g. 64x32 from FPGA,
-    or different sizes from Raw IQ Replay).
-    """
+    """Matplotlib canvas showing the 64x32 Range-Doppler map with dark theme."""
 
     def __init__(self, _parent=None):
         fig = Figure(figsize=(10, 6), facecolor=DARK_BG)
         self.ax = fig.add_subplot(111, facecolor=DARK_ACCENT)
 
-        # Initial backing data — will resize on first update_map call
-        self._n_range = NUM_RANGE_BINS
-        self._n_doppler = NUM_DOPPLER_BINS
-        self._data = np.zeros((self._n_range, self._n_doppler))
+        self._data = np.zeros((NUM_RANGE_BINS, NUM_DOPPLER_BINS))
         self.im = self.ax.imshow(
             self._data, aspect="auto", cmap="hot",
-            extent=[0, self._n_doppler, 0, self._n_range], origin="lower",
+            extent=[0, NUM_DOPPLER_BINS, 0, NUM_RANGE_BINS], origin="lower",
         )
 
-        self.ax.set_title(
-            f"Range-Doppler Map ({self._n_range}x{self._n_doppler})",
-            color=DARK_FG,
-        )
+        self.ax.set_title("Range-Doppler Map (64x32)", color=DARK_FG)
         self.ax.set_xlabel("Doppler Bin", color=DARK_FG)
         self.ax.set_ylabel("Range Bin", color=DARK_FG)
         self.ax.tick_params(colors=DARK_FG)
@@ -158,20 +109,7 @@ class RangeDopplerCanvas(FigureCanvasQTAgg):
         super().__init__(fig)
 
     def update_map(self, magnitude: np.ndarray, _detections: np.ndarray = None):
-        """Update the heatmap with new magnitude data.
-
-        Automatically resizes the canvas if the incoming shape differs from
-        the current backing array.
-        """
-        nr, nd = magnitude.shape
-        if nr != self._n_range or nd != self._n_doppler:
-            self._n_range = nr
-            self._n_doppler = nd
-            self._data = np.zeros((nr, nd))
-            self.im.set_extent([0, nd, 0, nr])
-            self.ax.set_title(
-                f"Range-Doppler Map ({nr}x{nd})", color=DARK_FG)
-
+        """Update the heatmap with new magnitude data."""
         display = np.log10(magnitude + 1)
         self.im.set_data(display)
         self.im.set_clim(vmin=display.min(), vmax=max(display.max(), 0.1))
@@ -215,15 +153,9 @@ class RadarDashboard(QMainWindow):
         self._gps_worker: GPSDataWorker | None = None
         self._simulator: TargetSimulator | None = None
 
-        # Raw IQ Replay
-        self._replay_controller: RawIQReplayController | None = None
-        self._replay_worker: RawIQReplayWorker | None = None
-        self._iq_processor: RawIQFrameProcessor | None = None
-
         # State
         self._running = False
         self._demo_mode = False
-        self._replay_status_override: str | None = None  # "playing"/"paused"
         self._start_time = time.time()
         self._current_frame: RadarFrame | None = None
         self._last_status: StatusResponse | None = None
@@ -420,8 +352,7 @@ class RadarDashboard(QMainWindow):
         # Row 0: connection mode + device combos + buttons
         ctrl_layout.addWidget(QLabel("Mode:"), 0, 0)
         self._mode_combo = QComboBox()
-        self._mode_combo.addItems([
-            "Mock", "Live FT2232H", "Replay (.npy)", "Raw IQ Replay (.npy)"])
+        self._mode_combo.addItems(["Mock", "Live FT2232H", "Replay (.npy)"])
         self._mode_combo.setCurrentIndex(0)
         ctrl_layout.addWidget(self._mode_combo, 0, 1)
 
@@ -469,104 +400,6 @@ class RadarDashboard(QMainWindow):
         self._status_label_main = QLabel("Status: Ready")
         self._status_label_main.setAlignment(Qt.AlignmentFlag.AlignRight)
         ctrl_layout.addWidget(self._status_label_main, 1, 5, 1, 5)
-
-        # Row 2: Raw IQ playback controls (hidden until Raw IQ mode active)
-        self._playback_frame = QFrame()
-        self._playback_frame.setStyleSheet(
-            f"background-color: {DARK_HIGHLIGHT}; border-radius: 4px;")
-        pb_layout = QHBoxLayout(self._playback_frame)
-        pb_layout.setContentsMargins(8, 4, 8, 4)
-
-        self._pb_play_btn = QPushButton("Play")
-        self._pb_play_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {DARK_SUCCESS}; color: white; }}")
-        self._pb_play_btn.clicked.connect(self._pb_play_pause)
-        pb_layout.addWidget(self._pb_play_btn)
-
-        self._pb_step_btn = QPushButton("Step")
-        self._pb_step_btn.clicked.connect(self._pb_step)
-        pb_layout.addWidget(self._pb_step_btn)
-
-        self._pb_stop_btn = QPushButton("Stop")
-        self._pb_stop_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {DARK_ERROR}; color: white; }}")
-        self._pb_stop_btn.clicked.connect(self._stop_radar)
-        pb_layout.addWidget(self._pb_stop_btn)
-
-        pb_layout.addWidget(QLabel("FPS:"))
-        self._pb_fps_spin = _make_dspin()
-        self._pb_fps_spin.setRange(0.1, 60.0)
-        self._pb_fps_spin.setValue(10.0)
-        self._pb_fps_spin.setSingleStep(1.0)
-        self._pb_fps_spin.valueChanged.connect(self._pb_fps_changed)
-        pb_layout.addWidget(self._pb_fps_spin)
-
-        self._pb_loop_check = QCheckBox("Loop")
-        self._pb_loop_check.setChecked(True)
-        self._pb_loop_check.toggled.connect(self._pb_loop_changed)
-        pb_layout.addWidget(self._pb_loop_check)
-
-        self._pb_frame_label = QLabel("Frame: 0 / 0")
-        self._pb_frame_label.setStyleSheet(
-            f"color: {DARK_INFO}; font-weight: bold;")
-        pb_layout.addWidget(self._pb_frame_label)
-
-        self._pb_file_label = QLabel("")
-        self._pb_file_label.setStyleSheet(f"color: {DARK_TEXT}; font-size: 10px;")
-        pb_layout.addWidget(self._pb_file_label)
-
-        pb_layout.addStretch()
-        self._playback_frame.setVisible(False)
-        ctrl_layout.addWidget(self._playback_frame, 2, 0, 1, 10)
-
-        # -- Waveform config row (Raw IQ replay only) -----------------------
-        self._waveform_frame = QFrame()
-        self._waveform_frame.setStyleSheet(
-            f"background-color: {DARK_ACCENT}; border-radius: 4px;")
-        wf_layout = QHBoxLayout(self._waveform_frame)
-        wf_layout.setContentsMargins(8, 4, 8, 4)
-
-        wf_layout.addWidget(QLabel("Waveform:"))
-
-        wf_layout.addWidget(QLabel("fs (MHz):"))
-        self._wf_fs_spin = _make_dspin()
-        self._wf_fs_spin.setRange(0.1, 100.0)
-        self._wf_fs_spin.setValue(4.0)
-        self._wf_fs_spin.setDecimals(2)
-        self._wf_fs_spin.setToolTip("ADC sample rate in MHz")
-        wf_layout.addWidget(self._wf_fs_spin)
-
-        wf_layout.addWidget(QLabel("BW (MHz):"))
-        self._wf_bw_spin = _make_dspin()
-        self._wf_bw_spin.setRange(1.0, 5000.0)
-        self._wf_bw_spin.setValue(500.0)
-        self._wf_bw_spin.setDecimals(1)
-        self._wf_bw_spin.setToolTip("Chirp bandwidth in MHz")
-        wf_layout.addWidget(self._wf_bw_spin)
-
-        wf_layout.addWidget(QLabel("T (us):"))
-        self._wf_chirp_spin = _make_dspin()
-        self._wf_chirp_spin.setRange(1.0, 10000.0)
-        self._wf_chirp_spin.setValue(300.0)
-        self._wf_chirp_spin.setDecimals(1)
-        self._wf_chirp_spin.setToolTip("Chirp duration in microseconds")
-        wf_layout.addWidget(self._wf_chirp_spin)
-
-        wf_layout.addWidget(QLabel("fc (GHz):"))
-        self._wf_fc_spin = _make_dspin()
-        self._wf_fc_spin.setRange(0.1, 100.0)
-        self._wf_fc_spin.setValue(10.0)
-        self._wf_fc_spin.setDecimals(2)
-        self._wf_fc_spin.setToolTip("Carrier frequency in GHz")
-        wf_layout.addWidget(self._wf_fc_spin)
-
-        self._wf_res_label = QLabel("")
-        self._wf_res_label.setStyleSheet(f"color: {DARK_INFO}; font-size: 10px;")
-        wf_layout.addWidget(self._wf_res_label)
-
-        wf_layout.addStretch()
-        self._waveform_frame.setVisible(False)
-        ctrl_layout.addWidget(self._waveform_frame, 3, 0, 1, 10)
 
         layout.addWidget(ctrl)
 
@@ -648,22 +481,12 @@ class RadarDashboard(QMainWindow):
         self._alt_spin.setValue(0.0)
         self._alt_spin.setSuffix(" m")
 
-        self._heading_spin = _make_dspin()
-        self._heading_spin.setRange(0, 360)
-        self._heading_spin.setDecimals(1)
-        self._heading_spin.setValue(0.0)
-        self._heading_spin.setSuffix("\u00b0")
-        self._heading_spin.setWrapping(True)
-        self._heading_spin.valueChanged.connect(self._on_position_changed)
-
         pos_layout.addWidget(QLabel("Latitude:"), 0, 0)
         pos_layout.addWidget(self._lat_spin, 0, 1)
         pos_layout.addWidget(QLabel("Longitude:"), 1, 0)
         pos_layout.addWidget(self._lon_spin, 1, 1)
         pos_layout.addWidget(QLabel("Altitude:"), 2, 0)
         pos_layout.addWidget(self._alt_spin, 2, 1)
-        pos_layout.addWidget(QLabel("Heading:"), 3, 0)
-        pos_layout.addWidget(self._heading_spin, 3, 1)
 
         sb_layout.addWidget(pos_group)
 
@@ -1386,10 +1209,6 @@ class RadarDashboard(QMainWindow):
         try:
             mode = self._mode_combo.currentText()
 
-            if "Raw IQ" in mode:
-                self._start_raw_iq_replay()
-                return
-
             if "Mock" in mode:
                 self._connection = FT2232HConnection(mock=True)
                 if not self._connection.open():
@@ -1429,7 +1248,6 @@ class RadarDashboard(QMainWindow):
             self._radar_worker.targetsUpdated.connect(self._on_radar_targets)
             self._radar_worker.statsUpdated.connect(self._on_radar_stats)
             self._radar_worker.errorOccurred.connect(self._on_worker_error)
-            self._radar_worker.finished.connect(self._on_worker_finished)
             self._radar_worker.start()
 
             # Optionally start GPS worker
@@ -1464,31 +1282,11 @@ class RadarDashboard(QMainWindow):
 
     def _stop_radar(self):
         self._running = False
-        self._replay_status_override = None
-
-        # Stop demo simulator if active (prevents cross-mode interference)
-        if self._simulator:
-            self._simulator.stop()
-            self._simulator = None
-            self._demo_mode = False
-            self._demo_btn_main.setText("Start Demo")
-            self._demo_btn_map.setText("Start Demo")
-            self._demo_btn_map.setChecked(False)
 
         if self._radar_worker:
             self._radar_worker.stop()
             self._radar_worker.wait(2000)
             self._radar_worker = None
-
-        # Raw IQ Replay cleanup
-        if self._replay_controller is not None:
-            self._replay_controller.stop()
-        if self._replay_worker is not None:
-            self._replay_worker.stop()
-            self._replay_worker.wait(2000)
-            self._replay_worker = None
-        self._replay_controller = None
-        self._iq_processor = None
 
         if self._gps_worker:
             self._gps_worker.stop()
@@ -1506,236 +1304,10 @@ class RadarDashboard(QMainWindow):
         self._mode_combo.setEnabled(True)
         self._demo_btn_main.setEnabled(True)
         self._demo_btn_map.setEnabled(True)
-        self._playback_frame.setVisible(False)
-        self._waveform_frame.setVisible(False)
-        self._pb_play_btn.setText("Play")
-        self._pb_frame_label.setText("Frame: 0 / 0")
-        self._pb_file_label.setText("")
         self._status_label_main.setText("Status: Radar stopped")
         self._sb_status.setText("Radar stopped")
         self._sb_mode.setText("Idle")
         logger.info("Radar system stopped")
-
-    # =====================================================================
-    # Raw IQ Replay
-    # =====================================================================
-
-    def _start_raw_iq_replay(self):
-        """Start raw IQ replay mode: load .npy file and begin playback."""
-        from PyQt6.QtWidgets import QFileDialog
-
-        npy_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Raw IQ .npy file", "",
-            "NumPy files (*.npy);;All files (*)")
-        if not npy_path:
-            return
-
-        try:
-            # Create controller and load file
-            self._replay_controller = RawIQReplayController()
-            info = self._replay_controller.load_file(npy_path)
-
-            # -- Waveform calibration: try to parse from filename -----------
-            parsed_wf = _parse_waveform_from_filename(Path(npy_path).name)
-            if parsed_wf is not None:
-                self._wf_fs_spin.setValue(parsed_wf.sample_rate_hz / 1e6)
-                self._wf_bw_spin.setValue(parsed_wf.bandwidth_hz / 1e6)
-                self._wf_chirp_spin.setValue(parsed_wf.chirp_duration_s / 1e-6)
-                self._wf_fc_spin.setValue(parsed_wf.center_freq_hz / 1e9)
-                logger.info("Waveform params parsed from filename: %s", parsed_wf)
-
-            # Build waveform config from (possibly updated) spinboxes
-            wfc = self._waveform_config_from_ui()
-            range_res = wfc.range_resolution(info.n_samples)
-            vel_res = wfc.velocity_resolution(info.n_samples, info.n_chirps)
-            n_range_out = min(64, info.n_samples)
-            max_range = range_res * n_range_out
-
-            # Create replay-specific RadarSettings with correct calibration
-            replay_settings = RadarSettings(
-                system_frequency=wfc.center_freq_hz,
-                range_resolution=range_res,
-                velocity_resolution=vel_res,
-                max_distance=max_range,
-                map_size=max_range * 1.2,
-                coverage_radius=max_range * 1.2,
-            )
-            logger.info(
-                "Replay calibration: range_res=%.4f m/bin, vel_res=%.4f m/s/bin, "
-                "max_range=%.1f m",
-                range_res, vel_res, max_range,
-            )
-
-            # Update coverage/map spinboxes to match replay scale
-            self._coverage_spin.setValue(replay_settings.coverage_radius / 1000)
-            self._update_waveform_res_label(info.n_samples, info.n_chirps)
-
-            # Create frame processor
-            self._iq_processor = RawIQFrameProcessor(
-                n_range_out=n_range_out,
-                n_doppler_out=min(32, info.n_chirps),
-            )
-
-            # Apply current AGC settings from FPGA Control tab
-            agc_enable = self._param_spins.get("0x28")
-            agc_target = self._param_spins.get("0x29")
-            agc_attack = self._param_spins.get("0x2A")
-            agc_decay = self._param_spins.get("0x2B")
-            agc_holdoff = self._param_spins.get("0x2C")
-            self._iq_processor.set_agc_config(AGCConfig(
-                enabled=bool(agc_enable.value()) if agc_enable else False,
-                target=agc_target.value() if agc_target else 200,
-                attack=agc_attack.value() if agc_attack else 1,
-                decay=agc_decay.value() if agc_decay else 1,
-                holdoff=agc_holdoff.value() if agc_holdoff else 4,
-            ))
-
-            # Apply CFAR settings
-            cfar_en = self._param_spins.get("0x25")
-            cfar_guard = self._param_spins.get("0x21")
-            cfar_train = self._param_spins.get("0x22")
-            cfar_alpha = self._param_spins.get("0x23")
-            cfar_mode = self._param_spins.get("0x24")
-            self._iq_processor.set_cfar_params(
-                enabled=bool(cfar_en.value()) if cfar_en else False,
-                guard=cfar_guard.value() if cfar_guard else 2,
-                train=cfar_train.value() if cfar_train else 8,
-                alpha_q44=cfar_alpha.value() if cfar_alpha else 0x30,
-                mode=cfar_mode.value() if cfar_mode else 0,
-            )
-
-            # Apply MTI / DC notch
-            mti_en = self._param_spins.get("0x26")
-            dc_notch = self._param_spins.get("0x27")
-            self._iq_processor.set_mti_enabled(
-                bool(mti_en.value()) if mti_en else False)
-            self._iq_processor.set_dc_notch_width(
-                dc_notch.value() if dc_notch else 0)
-
-            # Threshold
-            thresh = self._param_spins.get("0x03")
-            self._iq_processor.set_detect_threshold(
-                thresh.value() if thresh else 10000)
-
-            # Create worker
-            self._replay_worker = RawIQReplayWorker(
-                controller=self._replay_controller,
-                processor=self._iq_processor,
-                host_processor=self._processor,
-                settings=replay_settings,
-                gps_data_ref=self._radar_position,
-            )
-            self._replay_worker.frameReady.connect(self._on_frame_ready)
-            self._replay_worker.statusReceived.connect(self._on_status_received)
-            self._replay_worker.targetsUpdated.connect(self._on_radar_targets)
-            self._replay_worker.statsUpdated.connect(self._on_radar_stats)
-            self._replay_worker.errorOccurred.connect(self._on_worker_error)
-            self._replay_worker.finished.connect(self._on_worker_finished)
-            self._replay_worker.playbackStateChanged.connect(
-                self._on_playback_state_changed)
-            self._replay_worker.frameIndexChanged.connect(
-                self._on_frame_index_changed)
-
-            # Start worker (paused initially)
-            self._replay_worker.start()
-
-            # UI state
-            self._running = True
-            self._replay_status_override = "paused"
-            self._start_time = time.time()
-            self._frame_count = 0
-            self._start_btn.setEnabled(False)
-            self._stop_btn.setEnabled(True)
-            self._mode_combo.setEnabled(False)
-            self._demo_btn_main.setEnabled(False)
-            self._demo_btn_map.setEnabled(False)
-            self._playback_frame.setVisible(True)
-            self._waveform_frame.setVisible(True)
-            self._pb_frame_label.setText(f"Frame: 0 / {info.n_frames}")
-            self._pb_file_label.setText(
-                f"{Path(npy_path).name} "
-                f"({info.n_chirps}x{info.n_samples}, "
-                f"{info.file_size_mb:.1f} MB)")
-            self._status_label_main.setText("Status: Raw IQ Replay (paused)")
-            self._sb_status.setText("Raw IQ Replay")
-            self._sb_mode.setText("Raw IQ Replay")
-            logger.info(f"Raw IQ Replay started: {npy_path}")
-
-        except (ValueError, OSError) as e:
-            # Clean up any partially-created objects
-            if self._replay_worker is not None:
-                self._replay_worker.stop()
-                self._replay_worker.wait(1000)
-                self._replay_worker = None
-            self._replay_controller = None
-            self._iq_processor = None
-            QMessageBox.critical(self, "Error",
-                                 f"Failed to load raw IQ file:\n{e}")
-            logger.error(f"Raw IQ load error: {e}")
-
-    # ---- Playback control slots --------------------------------------------
-
-    def _pb_play_pause(self):
-        """Toggle play/pause for raw IQ replay."""
-        if self._replay_controller is None:
-            return
-        state = self._replay_controller.state
-        if state == PlaybackState.PLAYING:
-            self._replay_controller.pause()
-            self._pb_play_btn.setText("Play")
-        else:
-            self._replay_controller.play()
-            self._pb_play_btn.setText("Pause")
-
-    def _pb_step(self):
-        """Step one frame forward in raw IQ replay."""
-        if self._replay_controller is not None:
-            self._replay_controller.step_forward()
-
-    def _pb_fps_changed(self, value: float):
-        if self._replay_controller is not None:
-            self._replay_controller.set_fps(value)
-
-    def _pb_loop_changed(self, checked: bool):
-        if self._replay_controller is not None:
-            self._replay_controller.set_loop(checked)
-
-    def _waveform_config_from_ui(self) -> WaveformConfig:
-        """Build a WaveformConfig from the waveform spinboxes."""
-        return WaveformConfig(
-            sample_rate_hz=self._wf_fs_spin.value() * 1e6,
-            bandwidth_hz=self._wf_bw_spin.value() * 1e6,
-            chirp_duration_s=self._wf_chirp_spin.value() * 1e-6,
-            center_freq_hz=self._wf_fc_spin.value() * 1e9,
-        )
-
-    def _update_waveform_res_label(self, n_samples: int, n_chirps: int) -> None:
-        """Update the waveform resolution info label."""
-        wfc = self._waveform_config_from_ui()
-        r_res = wfc.range_resolution(n_samples)
-        v_res = wfc.velocity_resolution(n_samples, n_chirps)
-        n_r = min(64, n_samples)
-        max_r = r_res * n_r
-        self._wf_res_label.setText(
-            f"Range: {r_res:.3f} m/bin  |  Vel: {v_res:.3f} m/s/bin  |  "
-            f"Max range: {max_r:.1f} m ({n_r} bins)"
-        )
-
-    @pyqtSlot(str)
-    def _on_playback_state_changed(self, state_str: str):
-        if state_str == "playing":
-            self._pb_play_btn.setText("Pause")
-            self._replay_status_override = "playing"
-        elif state_str == "paused":
-            self._pb_play_btn.setText("Play")
-            self._replay_status_override = "paused"
-        elif state_str == "stopped":
-            self._replay_status_override = None
-            self._stop_radar()
-
-    @pyqtSlot(int, int)
-    def _on_frame_index_changed(self, current: int, total: int):
-        self._pb_frame_label.setText(f"Frame: {current} / {total}")
 
     # =====================================================================
     # Demo mode
@@ -1752,9 +1324,8 @@ class RadarDashboard(QMainWindow):
         self._simulator.targetsUpdated.connect(self._on_demo_targets)
         self._simulator.start(500)
         self._demo_mode = True
-        if not self._running:
-            self._sb_mode.setText("Demo Mode")
-            self._sb_status.setText("Demo mode active")
+        self._sb_mode.setText("Demo Mode")
+        self._sb_status.setText("Demo mode active")
         self._demo_btn_main.setText("Stop Demo")
         self._demo_btn_map.setText("Stop Demo")
         self._demo_btn_map.setChecked(True)
@@ -1767,18 +1338,12 @@ class RadarDashboard(QMainWindow):
         self._demo_mode = False
         if not self._running:
             mode = "Idle"
-        elif self._replay_controller is not None:
-            mode = "Raw IQ Replay"
         elif isinstance(self._connection, ReplayConnection):
             mode = "Replay"
         else:
-            # Use mode combo text for Mock vs Live distinction
-            mode = self._mode_combo.currentText()
-            if "Mock" not in mode and "Live" not in mode:
-                mode = "Live"
+            mode = "Live"
         self._sb_mode.setText(mode)
-        if not self._running:
-            self._sb_status.setText("Demo stopped")
+        self._sb_status.setText("Demo stopped")
         self._demo_btn_main.setText("Start Demo")
         self._demo_btn_map.setText("Start Demo")
         self._demo_btn_map.setChecked(False)
@@ -1829,12 +1394,6 @@ class RadarDashboard(QMainWindow):
     @pyqtSlot(str)
     def _on_worker_error(self, msg: str):
         logger.error(f"Worker error: {msg}")
-
-    def _on_worker_finished(self):
-        """Handle unexpected worker thread exit — recover UI to stopped state."""
-        if self._running:
-            logger.warning("Worker thread exited unexpectedly, resetting UI")
-            self._stop_radar()
 
     @pyqtSlot(object)
     def _on_gps_received(self, gps: GPSData):
@@ -2016,7 +1575,6 @@ class RadarDashboard(QMainWindow):
         self._radar_position.latitude = self._lat_spin.value()
         self._radar_position.longitude = self._lon_spin.value()
         self._radar_position.altitude = self._alt_spin.value()
-        self._radar_position.heading = self._heading_spin.value()
         self._map_widget.set_radar_position(self._radar_position)
         if self._simulator:
             self._simulator.set_radar_position(self._radar_position)
@@ -2091,17 +1649,10 @@ class RadarDashboard(QMainWindow):
             if self._running:
                 det = (self._current_frame.detection_count
                        if self._current_frame else 0)
-                # Preserve replay-specific status (paused/playing)
-                if self._replay_status_override == "paused":
-                    self._status_label_main.setText(
-                        f"Status: Raw IQ Replay (paused) \u2014 "
-                        f"Frames: {self._frame_count} \u2014 Detections: {det}"
-                    )
-                else:
-                    self._status_label_main.setText(
-                        f"Status: Running \u2014 Frames: {self._frame_count} "
-                        f"\u2014 Detections: {det}"
-                    )
+                self._status_label_main.setText(
+                    f"Status: Running \u2014 Frames: {self._frame_count} "
+                    f"\u2014 Detections: {det}"
+                )
 
             # Diagnostics values
             self._update_diagnostics()
@@ -2186,11 +1737,6 @@ class RadarDashboard(QMainWindow):
     def closeEvent(self, event):
         if self._simulator:
             self._simulator.stop()
-        if self._replay_controller is not None:
-            self._replay_controller.stop()
-        if self._replay_worker is not None:
-            self._replay_worker.stop()
-            self._replay_worker.wait(1000)
         if self._radar_worker:
             self._radar_worker.stop()
             self._radar_worker.wait(1000)
