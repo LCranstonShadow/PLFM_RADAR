@@ -24,6 +24,7 @@
 #include "adar1000.h"
 #include "ADAR1000_Manager.h"
 #include "ADAR1000_AGC.h"
+#include "um982_gps.h"
 extern "C" {
 #include "ad9523.h"
 }
@@ -121,8 +122,8 @@ UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-// The TinyGPSPlus object
-TinyGPSPlus gps;
+// Global UM982 instance
+UM982_GPS* um982_gps = nullptr;
 
 // Global data structures
 GPS_Data_t current_gps_data = {0};
@@ -322,6 +323,52 @@ void delay_ns(uint32_t nanoseconds)
     while ((DWT->CYCCNT - start_cycles) < cycles);
 }
 
+//////////////////////////////////////////////
+////////////////////UM982GPS//////////////////
+//////////////////////////////////////////////
+void initUM982GPS() {
+    // Initialize UM982 on UART5 (same as your current GPS)
+    um982_gps = new UM982_GPS(&huart5);
+    
+    if (um982_gps->init(true, true, 1.0f, 10)) {
+        uint8_t msg[] = "UM982 GPS initialized successfully\r\n";
+        HAL_UART_Transmit(&huart3, msg, sizeof(msg)-1, 1000);
+        
+    } else {
+        uint8_t msg[] = "UM982 GPS initialization failed\r\n";
+        HAL_UART_Transmit(&huart3, msg, sizeof(msg)-1, 1000);
+    }
+}
+
+void updateGPSData() {
+    if (um982_gps) {
+        um982_gps->process();
+        
+        if (um982_gps->isDataUpdated()) {
+            RADAR_Latitude = um982_gps->getLatitude();
+            RADAR_Longitude = um982_gps->getLongitude();
+            
+            // Update heading for stepper motor alignment
+            float heading = um982_gps->getHeading();
+            
+            // Use heading for North alignment
+            if (um982_gps->hasRTKFix()) {
+                // Use RTK heading for precise alignment
+                // Adjust stepper motor based on true heading
+            }
+            
+            // Update GPS data structure for GUI
+            current_gps_data.latitude = RADAR_Latitude;
+            current_gps_data.longitude = RADAR_Longitude;
+            current_gps_data.altitude = um982_gps->getAltitude();
+            current_gps_data.pitch = Pitch_Sensor;  // From IMU
+            current_gps_data.timestamp = HAL_GetTick();
+            
+            // Send to GUI
+            GPS_SendBinaryToGUI(&current_gps_data);
+        }
+    }
+}
 //////////////////////////////////////////////
 //////////////////////RADAR///////////////////
 //////////////////////////////////////////////
@@ -1456,6 +1503,8 @@ int main(void)
   HAL_Delay(100);
   DIAG("PWR", "FPGA power sequencing complete -- 1.0V -> 1.8V -> 3.3V");
 
+  // Initialize module UM982GPS
+  initUM982GPS();
 
 // Initialize module IMU
   DIAG_SECTION("IMU INIT (GY-85)");
@@ -1563,7 +1612,7 @@ int main(void)
 
     float magRawX = mx*cos(Pitch_Sensor*PI/180.0f)  - mz*sin(Pitch_Sensor*PI/180.0f);
 	float magRawY = mx*sin(Roll_Sensor*PI/180.0f)*sin(Pitch_Sensor*PI/180.0f) + my*cos(Roll_Sensor*PI/180.0f)- mz*sin(Roll_Sensor*PI/180.0f)*cos(Pitch_Sensor*PI/180.0f);
-    Yaw_Sensor = (180*atan2(magRawY,magRawX)/PI) - Mag_Declination;
+    Yaw_Sensor = heading - Mag_Declination;
 
     if(Yaw_Sensor<0)Yaw_Sensor+=360;
     RxEst_0 = RxEst_1;
@@ -1742,9 +1791,7 @@ int main(void)
     //////////////////////////////////////////GPS/////////////////////////////////////////
     //////////////////////////////////////////////////////////////////////////////////////
   for(int i=0; i<10;i++){
-  smartDelay(1000);
-  RADAR_Longitude = gps.location.lng();
-  RADAR_Latitude = gps.location.lat();
+  updateGPSData();
   }
 
   //move Stepper to position 1 = 0°
@@ -2567,7 +2614,7 @@ static void MX_UART5_Init(void)
 
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
-  huart5.Init.BaudRate = 9600;
+  huart5.Init.BaudRate = 115200;
   huart5.Init.WordLength = UART_WORDLENGTH_8B;
   huart5.Init.StopBits = UART_STOPBITS_1;
   huart5.Init.Parity = UART_PARITY_NONE;
