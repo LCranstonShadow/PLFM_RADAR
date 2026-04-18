@@ -42,6 +42,14 @@ Never run bare package installation commands without the `sfw` prefix.
 - **System-Level Invariants**:
   - Whenever adding code, verify that system-level invariants (across module, process, and chip boundaries) hold true.
 
+## AI Usage Policy
+
+The use of AI is permitted but we have to make sure that the quality and control of the codebase doesn't depend on the agents but the maintainer pushing the changes, meaning they are fully responsible for the code they commit.
+
+1. **Human Accountability** — The committing engineer is fully responsible for AI-generated code as if they wrote it. Every PR must be understood and defensible by a human.
+2. **Mandatory Review** — No raw AI output may be committed unread. AI code must pass the same review bar as hand-written code.
+3. **Full CI Before Commit** — All AI-assisted changes must pass the complete CI suite locally (lint, unit, regression, cross-layer) before commit.
+
 ## Running the Test Suites
 
 We use GitHub Actions for CI, which runs four main jobs on every PR. Run these locally before pushing.
